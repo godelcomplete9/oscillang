@@ -206,6 +206,13 @@ class Composer:
             [Message(role="user", content=prompt)], InvokeOptions(temperature=0.3)
         )
         parsed = _extract_json_object(response.text) or {}
+        if not parsed or "trigger" not in parsed or "promptFragment" not in parsed:
+            # Main Brain produced nothing usable (or just echoed the prompt):
+            # the promotion is not verified, so flag for review instead of
+            # promoting blindly.
+            flagged = skill.model_copy(update={"flagged_for_review": True})
+            self.store.save(flagged)
+            return flagged
         candidate = MiniSkill(
             id=skill.id,
             oscillator_id=skill.oscillator_id,

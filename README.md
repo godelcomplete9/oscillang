@@ -376,13 +376,13 @@ spec = InstantiationSpec(
     premise="A burned-out translator rediscovers her voice in a collapsing city",
     references=[Reference(name="Sample Author", sample_text="…prose sample…")],
     guiding_words=["frayed", "luminous", "stubborn"],
-    radius=1,                       # 2,000 oscillators
+    radius=1,  # 2,000 oscillators
 )
 
 crafter = Crafter(chat_model=FakeChatModel(), lattice_id="translator", seed=0)
-result = crafter.build(spec)        # hierarchy → oscillators → mini skills → coupling
+result = crafter.build(spec)  # hierarchy → oscillators → mini skills → coupling
 
-print(result.actual, result.mini_skills)   # 2000 2000 — always one-to-one
+print(result.actual, result.mini_skills)  # 2000 2000 — always one-to-one
 lattice = crafter.lattice
 ```
 
@@ -399,7 +399,7 @@ rng = np.random.default_rng(7)
 state = rng.normal(size=config.embedding_dim).astype(np.float32)
 
 for tick in range(50):
-    step_lattice(lattice, tick, config)                       # phase/fatigue/refractory
+    step_lattice(lattice, tick, config)  # phase/fatigue/refractory
     coh = coherence_query(lattice.normalized_embeddings, state)  # O(N·d)
     ...
 ```
@@ -432,16 +432,19 @@ from oscillang.skills.crafter import Crafter
 from oscillang.skills.model import HashingEmbedder
 
 crafter = Crafter(chat_model=my_chat, lattice_id="my-lattice")
-crafter.build(spec)                                   # 2k oscillators + mini skills
+crafter.build(spec)  # 2k oscillators + mini skills
 runtime = Runtime(
-    lattice=crafter.lattice, store=crafter.store,
-    chat_model=my_chat, embedder=HashingEmbedder(dim=crafter.config.embedding_dim),
-    premise=spec.premise, guiding_words=spec.guiding_words,
+    lattice=crafter.lattice,
+    store=crafter.store,
+    chat_model=my_chat,
+    embedder=HashingEmbedder(dim=crafter.config.embedding_dim),
+    premise=spec.premise,
+    guiding_words=spec.guiding_words,
 )
 result = runtime.respond("She asked about the missing page")
-print(result.response)          # Main Brain's rendered beat
-print(result.fired_ids)         # oscillators that gated open
-print(result.skill_ids)         # their one-to-one mini skills (used_count++)
+print(result.response)  # Main Brain's rendered beat
+print(result.fired_ids)  # oscillators that gated open
+print(result.skill_ids)  # their one-to-one mini skills (used_count++)
 ```
 
 ## 15. Package layout
