@@ -43,6 +43,7 @@ class Oscillator(BaseModel):
     phase: float = Field(ge=0.0, lt=2.0 * float(np.pi))
     amplitude: float = Field(ge=0.0, le=1.0)
     templateId: str | None = None
+    purpose: str | None = None
     lastFiredTick: int = -1
     refractoryUntilTick: int = -1
     embedding: list[float]
@@ -155,8 +156,13 @@ class OscillatorLattice:
         decay_rate: np.ndarray | None = None,
         last_fired_tick: np.ndarray | None = None,
         refractory_until_tick: np.ndarray | None = None,
+        ids: np.ndarray | None = None,
     ) -> np.ndarray:
-        """Bulk-append rows; all inputs are arrays of length k. Returns new ids."""
+        """Bulk-append rows; all inputs are arrays of length k. Returns new ids.
+
+        ``ids`` may be supplied (e.g. ontology path ids like
+        ``OSC-D03-F02-M01-S01-MV02-P01``); otherwise ``osc-N`` ids are generated.
+        """
         k = int(hz.shape[0])
         if k == 0:
             return np.empty(0, dtype=object)
@@ -186,7 +192,7 @@ class OscillatorLattice:
         if template_ids is not None:
             self.template_id[start:end] = template_ids
         self.embeddings[start:end] = embeddings
-        self.ids[start:end] = _make_ids(start, k)
+        self.ids[start:end] = ids if ids is not None else _make_ids(start, k)
         self._n = end
         self._normed = None
         if self._coupling is not None:
@@ -253,9 +259,10 @@ class OscillatorLattice:
             id=str(self.ids[i]),
             domain=DOMAINS[int(self.domain[i])].value,
             func=FUNCS[int(self.func[i])].value,
-            mode=MODES[int(self.mode[i])],
-            stance=STANCES[int(self.stance[i])],
-            move=MOVES[int(self.move[i])],
+            mode=_vocab_label(MODES, int(self.mode[i])),
+            stance=_vocab_label(STANCES, int(self.stance[i])),
+            move=_vocab_label(MOVES, int(self.move[i])),
+            purpose=None,
             hz=float(self.hz[i]),
             phase=float(self.phase[i]),
             amplitude=float(self.amplitude[i]),
@@ -272,6 +279,11 @@ class OscillatorLattice:
 
 
 # --- helpers -----------------------------------------------------------------
+def _vocab_label(vocab: tuple[str, ...], code: int) -> str:
+    """Safe vocab lookup; crafted oscillators may use extended vocab codes."""
+    return vocab[code] if 0 <= code < len(vocab) else f"custom-{code}"
+
+
 def l2_normalize_rows(mat: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     norms = np.linalg.norm(mat, axis=1, keepdims=True)
     return mat / np.maximum(norms, eps).astype(mat.dtype)
