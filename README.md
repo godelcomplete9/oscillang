@@ -407,6 +407,43 @@ for tick in range(50):
 LangChain-style composition (`agent | OutputParser | Postprocess`), callbacks, and
 `Scene`/`Beat` mode land with the runtime milestone.
 
+### Runtime: one turn of the loop
+
+`Runtime.respond` is the fire decision end to end:
+
+1. **Encode** the user input; state vector = `g_ext`·input + `g_sim`·memory
+   trace + `g_self`·last output (`compose_state_vector`).
+2. **Perturb** phases — external drive proportional to coherence, plus guard
+   noise injection after dead-coherence watchdogs.
+3. **Score** every oscillator with the numeric Jev: coherence (measured
+   against skill texts, not path texts), phase proximity, memory, amplitude,
+   minus use cost and coupling pressure, plus seeded noise.
+4. **Fire decision**: candidate pool = Jev above the adaptive threshold and
+   not refractory; the top-Jev oscillator leads, and the rest fire only when
+   phase-locked AND coherent with the leader (M1's lock gate, pairwise);
+   capped at `top_k`. Main Brain renders **once** for the whole fired set.
+5. **Step** the lattice (phase, fatigue, refractory), `record_use` each fired
+   skill (promotion after > 5 uses), update the leaky memory trace, run the
+   guards (threshold drop / raise, noise inject, silence nudge).
+
+```python
+from oscillang.runtime import Runtime
+from oscillang.skills.crafter import Crafter
+from oscillang.skills.model import HashingEmbedder
+
+crafter = Crafter(chat_model=my_chat, lattice_id="my-lattice")
+crafter.build(spec)                                   # 2k oscillators + mini skills
+runtime = Runtime(
+    lattice=crafter.lattice, store=crafter.store,
+    chat_model=my_chat, embedder=HashingEmbedder(dim=crafter.config.embedding_dim),
+    premise=spec.premise, guiding_words=spec.guiding_words,
+)
+result = runtime.respond("She asked about the missing page")
+print(result.response)          # Main Brain's rendered beat
+print(result.fired_ids)         # oscillators that gated open
+print(result.skill_ids)         # their one-to-one mini skills (used_count++)
+```
+
 ## 15. Package layout
 
 ```
@@ -433,8 +470,9 @@ examples/
 |---|---|
 | `core/` — lattice, coupling, dynamics, coherence, gating | ✅ done (M1) |
 | `llm/` — ChatModel protocol, OpenAI adapter, FakeChatModel | ✅ done |
-| `skills/` — ontology, crafter, store, checkpoint, composer | ✅ built (tests landing) |
-| `jev/`, `runtime/`, `memory/`, `world/`, `strip/`, `eval/`, `logging/`, `chains/`, `cli.py` | 🔜 next milestones |
+| `skills/` — ontology, crafter, store, checkpoint, composer | ✅ done (M2) |
+| `runtime/` — perturb → Jev gate → fire → Main Brain render, guards, leaky memory | ✅ done (M3) |
+| `memory/`, `world/`, `strip/`, `eval/`, `logging/`, `chains/`, `cli.py` | 🔜 next milestones |
 
 ## 17. Development
 
