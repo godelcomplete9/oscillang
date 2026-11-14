@@ -2,6 +2,9 @@
 
 **An oscillator-gated nervous system for LLM agents.**
 
+<img width="2288" height="1088" alt="image" src="https://github.com/user-attachments/assets/e25c895f-4ed4-4df1-96be-8c2043945cf6" />
+
+
 A cheap decision model (**Jev**) decides in parallel — over thousands of phase-coupled oscillators — which behavioral fragments should gate, fire, wait, avoid, or forget. The generative LLM (**Main Brain**) only renders text *inside* a fire decision.
 
 > **Hard separation of powers:** Jev never generates text. Main Brain never decides. One `Jev.decide()` per tick, one Main Brain call per fire — never per oscillator, never per template. Everything inside a tick is vectorized numpy.
