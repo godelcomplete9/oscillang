@@ -31,6 +31,8 @@ from oscillang.core.gating import (
     wrap_phase_diff,
 )
 from oscillang.core.lattice import OscillatorLattice, l2_normalize_rows
+from oscillang.jev.base import JevContext, JevModel
+from oscillang.jev.rule_jev import RuleJev
 from oscillang.llm.base import ChatModel, InvokeOptions, Message
 from oscillang.runtime.guards import GuardState
 from oscillang.runtime.memory import MemoryTrace
@@ -71,8 +73,10 @@ class Runtime:
         seed: int = 0,
         premise: str = "",
         guiding_words: list[str] | None = None,
+        jev: JevModel | None = None,
     ) -> None:
         self.config = (config or Config()).validated()
+        self.jev: JevModel = jev if jev is not None else RuleJev(self.config)
         self.lattice = lattice
         self.store = store
         self.chat_model = chat_model
@@ -144,13 +148,14 @@ class Runtime:
         z = np.sum(weights.astype(np.complex128) * np.exp(1j * phase.astype(np.float64)))
         return float(np.angle(z)) % TWO_PI
 
-    def _jev_scores(
+    def _jev_context(
         self,
+        ids: list[str],
         coherence: np.ndarray,
         phase: np.ndarray,
         ref_phase: float,
         memory_sim: np.ndarray,
-    ) -> np.ndarray:
+    ) -> JevContext:
         cfg = self.config
         n = self.lattice.n
         phase_prox = (1.0 - wrap_phase_diff(phase - ref_phase) / PI).astype(np.float32)
@@ -174,16 +179,18 @@ class Runtime:
             if cfg.noise_enabled
             else np.zeros(n, dtype=np.float32)
         )
-        jev = (
-            cfg.w_coh * coherence
-            + cfg.w_phase * phase_prox
-            + (cfg.w_mem * memory_sim if cfg.leaky_memory else 0.0)
-            + cfg.w_fat * amp
-            - cfg.w_cost * cost
-            - cfg.w_coup * coup
-            + noise
+        refractory = self.lattice.refractory_until_tick[:n] > self.tick
+        return JevContext(
+            ids=ids,
+            coherence=coherence,
+            phase_prox=phase_prox,
+            memory_sim=memory_sim,
+            amplitude=amp,
+            used_cost=cost,
+            coupling=coup,
+            refractory=refractory,
+            noise=noise,
         )
-        return jev.astype(np.float32)
 
     # --- rendering ------------------------------------------------------------
     def _fragment_block(self, skills: list[MiniSkill]) -> str:
@@ -249,10 +256,12 @@ class Runtime:
 
         ref_phase = self._reference_phase(self.lattice.phase[:n], coherence)
         memory_sim = self.memory.similarity(self._skill_normed)
-        jev = self._jev_scores(coherence, self.lattice.phase[:n], ref_phase, memory_sim)
+        ids = [str(i) for i in self.lattice.ids[:n]]
+        ctx = self._jev_context(ids, coherence, self.lattice.phase[:n], ref_phase, memory_sim)
+        jev = self.jev.score(ctx)
 
         # Candidate pool: Jev above the (adaptive) threshold and not refractory.
-        refractory = self.lattice.refractory_until_tick[:n] > self.tick
+        refractory = ctx.refractory
         pool = (jev > self.guards.v_threshold) & ~refractory
         fired_idx = np.empty(0, dtype=np.int64)
         fired_scores = np.empty(0, dtype=np.float32)

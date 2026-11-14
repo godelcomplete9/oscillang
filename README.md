@@ -472,6 +472,7 @@ examples/
 | `llm/` — ChatModel protocol, OpenAI adapter, FakeChatModel | ✅ done |
 | `skills/` — ontology, crafter, store, checkpoint, composer | ✅ done (M2) |
 | `runtime/` — perturb → Jev gate → fire → Main Brain render, guards, leaky memory | ✅ done (M3) |
+| `jev/` — RuleJev (default), LlmJev (one call per fire decision), MlpJev (learned hook), schema | ✅ done (M4) |
 | `memory/`, `world/`, `strip/`, `eval/`, `logging/`, `chains/`, `cli.py` | 🔜 next milestones |
 
 ## 17. Development
