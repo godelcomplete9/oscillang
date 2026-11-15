@@ -34,10 +34,8 @@ class Config:
     # slow to touch per tick).
     sparse_coupling_threshold: int = 20000
 
-    # --- coherence / lock gating -------------------------------------------
-    query_aware: bool = False
+    # --- lock gating -------------------------------------------------------
     lock_tolerance: float = 0.4
-    lock_threshold: float = 0.6
     top_k: int = 12  # retrieval K, valid range 8-16
 
     # --- fatigue / refractory ----------------------------------------------
@@ -50,24 +48,27 @@ class Config:
     unused_drift_rate: float = 0.01
 
     # --- Jev scoring -------------------------------------------------------
+    # The prefilter scores dynamics only; semantic alignment is the
+    # reranker's verdict (scored 0-1 against ``v_threshold``).
     noise: float = 0.05
-    w_coh: float = 1.0
     w_phase: float = 0.8
-    w_mem: float = 0.6
+    w_rec: float = 0.4
     w_fat: float = 0.7
     w_cost: float = 0.5
     w_coup: float = 0.4
     v_threshold: float = 0.65
+    jev_shortlist: int = 24
 
     # --- input gains -------------------------------------------------------
     g_ext: float = 1.0
-    g_sim: float = 0.3
-    g_self: float = 0.5
 
     # --- lattice -----------------------------------------------------------
     embedding_dim: int = 32
 
     # --- ablation switches (False = mechanism disabled) ---------------------
+    # phase_gating off removes the phase-lock hard gate (refractory only).
+    # world_model passes the previous beat to Jev as rerank context.
+    # leaky_memory enables the recency boost for recently fired skills.
     phase_gating: bool = True
     coupling_plasticity: bool = True
     fatigue: bool = True
@@ -85,7 +86,7 @@ class Config:
     guard_vth_step: float = 0.05
     guard_noise_inject: float = 0.1
 
-    # --- memory (later milestones) -----------------------------------------
+    # --- recency memory (leaky trace) --------------------------------------
     memory_alpha: float = 0.95
     memory_fade_ticks: int = 20
     memory_prune_size: int = 10000

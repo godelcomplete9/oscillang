@@ -5,9 +5,16 @@
 <img width="2288" height="1088" alt="image" src="https://github.com/user-attachments/assets/e25c895f-4ed4-4df1-96be-8c2043945cf6" />
 
 
-A cheap decision model (**Jev**) decides in parallel — over thousands of phase-coupled oscillators — which behavioral fragments should gate, fire, wait, avoid, or forget. The generative LLM (**Main Brain**) only renders text *inside* a fire decision.
+A cheap decision model (**Jev**) decides which behavioral fragments fire. Jev verifies semantic
+coherence and alignment: it is a reranker that scores the candidate mini skills against the user
+input and gates them; the oscillator lattice (thousands of phase-coupled oscillators) contributes
+the dynamics hard gate — phase lock, fatigue, refractory — never a semantic signal. The generative
+LLM (**Main Brain**) only renders text *inside* a fire decision.
 
-> **Hard separation of powers:** Jev never generates text. Main Brain never decides. One `Jev.decide()` per tick, one Main Brain call per fire — never per oscillator, never per template. Everything inside a tick is vectorized numpy.
+> **Hard separation of powers:** Jev never generates text. Main Brain never decides. One Jev
+> rerank per fire decision, one Main Brain call per fire — never per oscillator, never per
+> template. No embedding cosine anywhere in the fire path: semantics belong to Jev, dynamics to
+> the lattice.
 
 ---
 
@@ -44,8 +51,10 @@ At every tick:
 
 - oscillators advance on their own clocks (fast fragments spin at ~1 Hz, slow ones — worldview,
   core wounds — at ~0.05 Hz);
-- fragments drift in and out of **phase lock** and **coherence** with the current state;
-- **Jev** scores them all in one matmul and decides: gate a handful, fire one response, or stay silent;
+- fragments drift in and out of **phase lock** with each other; the lattice's hard gate is pure
+  dynamics;
+- **Jev** verifies semantic alignment: each turn, the shortlisted mini skills' actual texts are
+  reranked against the user input — gate a handful, fire one response, or stay silent;
 - only when Jev fires does Main Brain render, and only from the fragments that gated (**the Strip**);
 - using a fragment fatigues it (it decays and goes refractory), so the same task ten times in a row
   routes through a *different* fragment — the agent changes voice naturally;
@@ -65,14 +74,15 @@ flowchart TB
     end
 
     subgraph TICK["Tick loop (runtime)"]
-        IN["I(t) = g_ext·I_ext + g_sim·I_sim<br/>+ g_self·I_self + noise"] --> DYN["Vectorized dynamics<br/>phase · fatigue · refractory · memory decay"]
-        DYN --> STATE["JevState<br/>(top-K, coherence, memory, world)"]
-        STATE --> JEV["Jev.decide() · once per tick"]
-        JEV -->|"fire = True"| STRIP["Strip builder<br/>identity + fragments + canon + bans"]
+        IN["User input"] --> DYN["Vectorized dynamics<br/>uniform g_ext drive · phase · fatigue · refractory"]
+        DYN --> PREF["Dynamics prefilter (RuleJev)<br/>shortlist top jev_shortlist candidates"]
+        PREF --> JEV["Jev rerank · once per turn<br/>(input + candidate skill texts)"]
+        JEV -->|"alignment verdicts"| GATE["Fire decision<br/>verdict > adaptive threshold<br/>AND phase-locked to leader<br/>AND not refractory"]
+        GATE -->|"fired"| STRIP["Strip builder<br/>identity + fragments + canon + bans"]
         STRIP --> MB["Main Brain<br/>· one call"]
-        JEV -->|"fire = False"| SILENCE["Silence path<br/>Echo → Simulation → Drift"]
+        GATE -->|"nothing fires"| SILENCE["Silence path<br/>guards adapt, watchdogs nudge"]
         MB --> EVAL["Reward / world-model error"]
-        EVAL --> UPD["Coupling update · gains · memory · guards"]
+        EVAL --> UPD["Coupling update · memory · guards"]
         SILENCE --> UPD
         UPD --> LOG["JSONL tick log"]
     end
@@ -82,9 +92,8 @@ flowchart TB
 ```
 
 ```
-Jev.decide()  ──►  JevDecision (JSON, schema-validated)
-                  { gate 0..1, fire bool, templateId, shift,
-                    couplingDelta, gainDelta, evaluation, confidence }
+Jev.rerank()  ──►  JevDecision (JSON, schema-validated)
+                   { scores: [ { oscillatorId, score 0..1 alignment, reason } ] }
 ```
 
 ## 3. The oscillator model
@@ -246,33 +255,35 @@ Everything below is one vectorized numpy call — **no Python loop over oscillat
 |---|---|
 | Phase | `phase = (phase + 2π·hz·step) mod 2π` |
 | Kuramoto coupling (optional, off by default) | `dphase += K·Σⱼ Cᵢⱼ·sin(φⱼ−φᵢ)` — computed as two matvecs via the sin/cos identity |
-| Coherence | `V·Vᵀ` on L2-normalized embeddings; optional `query_aware` adds similarity to a state vector built from I(t), scene objective, recent thoughts |
-| Lock gating | gate **only if** wrapped phaseDiff < 0.4 rad **AND** coherence > 0.6. High similarity with low phase lock must NOT gate |
+| Coherence (craft-time utility) | `V·Vᵀ` on L2-normalized embeddings; used by the crafter for redundant-fragment pruning, never by the runtime fire path |
+| Lock gating (dynamics only) | gate **only if** wrapped phaseDiff < 0.4 rad. Semantic alignment is never a property of this gate — it is Jev's verdict |
 | Fatigue on use | `amp = amp·decayPerUse + recoveryPerTick` (0.08 / 0.02) |
 | Recovery | unused: `amp += recoveryPerTick`, clamped [0,1]; unused fragments drift toward baseline 0.5 |
 | Refractory | 2 ticks for fast oscillators (hz ≥ 0.6), 5 ticks for slow |
 | Coupling plasticity | `C += Δ·fireMask`, Δ ∈ [−0.1, 0.1], STDP-style credit (fired-just-before-success strengthens; before failure weakens), ×0.999 decay per tick, clamp [0,1] |
-| Retrieval | one batched top-K (K = 8–16) by embedding similarity (+ phase coherence), FAISS if installed else numpy |
+| Retrieval | one batched top-K (K = 8–16) by score (Jev verdicts at runtime, embedding similarity as a core utility), FAISS if installed else numpy |
 
-Input signal: `I(t) = g_ext·I_ext + g_sim·I_sim + g_self·I_self + noise` with gains 1.0 / 0.3 / 0.5.
-In silence `g_ext` decays while `g_sim` and `g_self` rise, and the progression runs
-**Echo → Simulation → Drift**; after 10 silent ticks a watchdog injects a self-prompt tagged
-`ext/sim/self`.
+Input signal: a uniform external phase drive `g_ext` (+ guard noise injection after the
+dead-alignment watchdog). There is no embedding-weighted drive: the input's semantic pull is
+Jev's alignment verdict, not a cosine.
 
 ## 6. Jev: the decision layer
 
-Three interchangeable implementations behind one interface, **exactly one `decide()` per tick**:
+Jev verifies semantic coherence and alignment — it is a reranker and the main gatekeeper of a
+mini skill. Two roles share one package:
 
-| Jev | Mechanism |
-|---|---|
-| `RuleJev` (default, baseline) | `score = w_coh·coherence + w_phase·phaseAlign + w_mem·memWeight − w_fat·fatigue − w_cost·emotionalCost + w_coup·coupling + noise` — one matmul over candidates. Membrane potential `V` accumulates while coherence is high and decays otherwise; **fire when `V ≥ 0.65`**, then reset and set refractory. Select by argmax; ties broken by coupling history, then fatigue |
-| `LLMJev` | one structured-output call per tick, schema-validated, retry once, fall back to RuleJev |
-| `MLPJev` | small 2-layer MLP distilled from logged `(state, decision, reward)` triples |
+| Role | Implementation | Mechanism |
+|---|---|---|
+| Dynamics prefilter (`JevModel`) | `RuleJev` (default) | `score = w_phase·phaseProx + w_rec·recency + w_fat·amplitude − w_cost·usedCost − w_coup·coupling + noise` — one vectorized pass over all oscillators; dynamics only, no semantic signal. The top `jev_shortlist` candidates form the reranker's shortlist |
+| Learned hook (`JevModel`) | `MlpJev` | small 2-layer numpy MLP over the same dynamics features, distilled from logged `(state, decision, reward)` triples; can also gate alone in dynamics-only mode |
+| Semantic reranker (`JevReranker`) | `LlmJev` (default) | ONE structured-output call per fire decision: the candidate mini skills' actual texts (trigger, fragment, examples) go into the prompt next to the user input; the model returns an alignment verdict `score ∈ [0, 1]` per candidate |
 
-The decision is JSON-only and schema-validated:
-`{gate, fire, templateId, shift, couplingDelta, gainDelta, evaluation, confidence}`.
-A frozen baseline Jev is kept for comparison. Every tick logs `JevState`, `JevDecision`,
-Strip, output, reward, prediction error, gains, fireMask to JSONL.
+The rerank decision is JSON-only and schema-validated:
+`{scores: [{oscillatorId, score, reason}]}`. An unparseable or invalid response yields **zero
+verdicts — silence can never fire**, and Main Brain is never consulted without a fire decision.
+
+**Fire decision:** verdict above the adaptive threshold (`v_threshold`, adjusted by the guards)
+AND phase-locked to the highest-verdict leader AND not refractory, capped at `top_k`.
 
 ## 7. Memory: leaky psychology, perfect canon
 
@@ -411,19 +422,22 @@ LangChain-style composition (`agent | OutputParser | Postprocess`), callbacks, a
 
 `Runtime.respond` is the fire decision end to end:
 
-1. **Encode** the user input; state vector = `g_ext`·input + `g_sim`·memory
-   trace + `g_self`·last output (`compose_state_vector`).
-2. **Perturb** phases — external drive proportional to coherence, plus guard
-   noise injection after dead-coherence watchdogs.
-3. **Score** every oscillator with the numeric Jev: coherence (measured
-   against skill texts, not path texts), phase proximity, memory, amplitude,
-   minus use cost and coupling pressure, plus seeded noise.
-4. **Fire decision**: candidate pool = Jev above the adaptive threshold and
-   not refractory; the top-Jev oscillator leads, and the rest fire only when
-   phase-locked AND coherent with the leader (M1's lock gate, pairwise);
-   capped at `top_k`. Main Brain renders **once** for the whole fired set.
+1. **Perturb** phases — a uniform external drive (`g_ext`) plus guard noise
+   injection after the dead-alignment watchdog.
+2. **Prefilter** every oscillator with the dynamics RuleJev (phase proximity
+   to the amplitude-weighted reference, recency, amplitude, minus use cost
+   and coupling pressure, plus seeded noise); the top `jev_shortlist`
+   non-refractory candidates form the reranker's shortlist.
+3. **Verify** semantic alignment: Jev (default `LlmJev`) receives the user
+   input and each shortlisted mini skill's actual texts and returns an
+   alignment verdict per candidate. With a numeric Jev injected instead
+   (e.g. `MlpJev`), its score is thresholded directly (dynamics-only mode).
+4. **Fire decision**: verdict above the adaptive threshold and not
+   refractory; the top-verdict candidate leads, and the rest fire only when
+   phase-locked to the leader; capped at `top_k`. Main Brain renders **once**
+   for the whole fired set.
 5. **Step** the lattice (phase, fatigue, refractory), `record_use` each fired
-   skill (promotion after > 5 uses), update the leaky memory trace, run the
+   skill (promotion after > 5 uses), update the leaky recency trace, run the
    guards (threshold drop / raise, noise inject, silence nudge).
 
 ```python
@@ -454,11 +468,11 @@ oscillang/
   core/      lattice.py coherence.py gating.py dynamics.py coupling.py banks.py config.py
   skills/    model.py store.py checkpoint.py crafter.py composer.py
   llm/       base.py openai.py fake.py
-  jev/       base.py rule_jev.py llm_jev.py mlp_jev.py schema.py        (next milestone)
+  jev/       base.py rule_jev.py llm_jev.py mlp_jev.py schema.py
   memory/    leaky.py canon.py
   world/     model.py
   strip/     builder.py
-  runtime/   tick_loop.py guards.py session.py
+  runtime/   engine.py guards.py memory.py
   eval/      reward.py acceptance.py ablation.py
   logging/   jsonl.py
   chains/    runnable.py
@@ -474,8 +488,8 @@ examples/
 | `core/` — lattice, coupling, dynamics, coherence, gating | ✅ done (M1) |
 | `llm/` — ChatModel protocol, OpenAI adapter, FakeChatModel | ✅ done |
 | `skills/` — ontology, crafter, store, checkpoint, composer | ✅ done (M2) |
-| `runtime/` — perturb → Jev gate → fire → Main Brain render, guards, leaky memory | ✅ done (M3) |
-| `jev/` — RuleJev (default), LlmJev (one call per fire decision), MlpJev (learned hook), schema | ✅ done (M4) |
+| `runtime/` — perturb → dynamics prefilter → Jev rerank → phase-lock fire → Main Brain render, guards, leaky recency | ✅ done (M3, redesigned M5) |
+| `jev/` — RuleJev (dynamics prefilter), LlmJev (semantic reranker, one call per fire decision), MlpJev (learned hook), schema | ✅ done (M4, redesigned M5) |
 | `memory/`, `world/`, `strip/`, `eval/`, `logging/`, `chains/`, `cli.py` | 🔜 next milestones |
 
 ## 17. Development

@@ -1,16 +1,16 @@
 """Runtime guards: the watchdogs that keep the loop from locking up.
 
-Pure logic, no lattice access: ``GuardState.update`` takes the outcomes of one
-tick (did anything fire, how alive was the coherence, did Main Brain answer)
-and returns guard events. The engine reacts to events:
+Pure logic, no lattice access: ``GuardState.update`` takes the outcomes of
+one tick (did anything fire, how strong was the best alignment verdict, did
+Main Brain answer) and returns guard events. The engine reacts to events:
 
 - ``no_fire_threshold_drop``: nothing fired for ``no_fire_ticks`` -> Jev
   threshold drops by ``guard_vth_step`` (floored at 0.05).
 - ``overfire_threshold_raise``: something fired every tick for
   ``fire_every_tick_window`` -> threshold rises by the same step (capped 0.99).
-- ``dead_coherence_noise_inject``: max coherence under 0.05 for
-  ``dead_coherence_ticks`` -> engine injects ``guard_noise_inject`` radians of
-  random phase next tick.
+- ``dead_coherence_noise_inject``: the best alignment verdict stayed under
+  0.05 for ``dead_coherence_ticks`` -> engine injects ``guard_noise_inject``
+  radians of phase drive next tick.
 - ``silence_watchdog``: Main Brain returned nothing for
   ``silence_watchdog_ticks`` -> engine forces a re-render with a nudge next
   turn.
@@ -38,7 +38,7 @@ class GuardState:
         self._dead_coh = 0
         self._silent = 0
 
-    def update(self, fired: bool, max_coherence: float, responded: bool) -> list[str]:
+    def update(self, fired: bool, max_verdict: float, responded: bool) -> list[str]:
         """Feed one tick's outcome; returns guard events raised this tick."""
         cfg = self.config
         events: list[str] = []
@@ -55,7 +55,7 @@ class GuardState:
             events.append("overfire_threshold_raise")
             self._overfire = 0
 
-        self._dead_coh = self._dead_coh + 1 if max_coherence < DEAD_COHERENCE_FLOOR else 0
+        self._dead_coh = self._dead_coh + 1 if max_verdict < DEAD_COHERENCE_FLOOR else 0
         if self._dead_coh >= cfg.dead_coherence_ticks:
             events.append("dead_coherence_noise_inject")
             self._dead_coh = 0

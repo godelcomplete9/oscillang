@@ -3,7 +3,7 @@
 Budgets (spec): 20,000 oscillators / 100 ticks -> p50 tick < 150ms (no Main
 Brain); 2,000 -> < 50ms; 200,000 composed -> < 400ms. Each tick exercises the
 full core path: phase/amplitude/refractory dynamics, retrieval top-K,
-candidate coherence, phase-diff lock gating, coupling row sums and decay.
+candidate phase-diff lock gating, coupling row sums and decay.
 
 Budgets are wall-clock budgets against a developer workstation. Shared CI
 runners are slower and noisy, so when the CI environment variable is set the
@@ -17,7 +17,6 @@ import time
 
 import numpy as np
 
-from oscillang.core.coherence import coherence_pairs
 from oscillang.core.config import Config
 from oscillang.core.coupling import CouplingMatrix
 from oscillang.core.dynamics import step_lattice
@@ -31,12 +30,11 @@ def core_tick(lat: OscillatorLattice, tick: int, cfg: Config, query: np.ndarray)
     step_lattice(lat, tick, cfg)
     scores = lat.normalized_embeddings @ query
     idx, _ = retrieval_top_k(scores, cfg.top_k)
-    coh = coherence_pairs(lat.embeddings, idx)
     diff = phase_diff_matrix(lat.phase[idx])
     refractory = (lat.refractory_until_tick[idx] > tick)[:, None] | (
         lat.refractory_until_tick[idx] > tick
     )[None, :]
-    gate = lock_gate(diff, coh, refractory, cfg.lock_tolerance, cfg.lock_threshold)
+    gate = lock_gate(diff, refractory, cfg.lock_tolerance)
     lat.coupling.row_sums()
     lat.coupling.decay()
     return int(np.count_nonzero(gate))

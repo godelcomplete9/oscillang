@@ -1,9 +1,10 @@
-"""MlpJev: tiny numpy perceptron - the learned-Jev hook.
+"""MlpJev: tiny numpy perceptron - the learned dynamics prefilter.
 
 Two layers, tanh hidden, no torch dependency, fully deterministic from the
-seed. ``learn`` does one SGD step toward per-oscillator targets (reward signal
-lands with the eval milestone). Output is clipped to [0, 2] so a wild network
-can never dominate the rule scorer's range.
+seed. It scores dynamics only (no semantic signal - alignment is the
+reranker's job). ``learn`` does one SGD step toward per-oscillator targets
+(reward signal lands with the eval milestone). Output is clipped to [0, 2]
+so a wild network can never dominate the rule scorer's range.
 """
 
 from __future__ import annotations
@@ -14,16 +15,15 @@ from oscillang.jev.base import JevContext
 
 __all__ = ["MlpJev"]
 
-FEATURES = 6
+FEATURES = 5
 
 
 def _feature_matrix(ctx: JevContext) -> np.ndarray:
-    """(6, N): coh, phase prox, memory, amplitude, -cost, -coupling."""
+    """(5, N): phase prox, recency, amplitude, -cost, -coupling."""
     return np.stack(
         [
-            ctx.coherence,
             ctx.phase_prox,
-            ctx.memory_sim,
+            ctx.recency,
             ctx.amplitude,
             -ctx.used_cost,
             -ctx.coupling,

@@ -1,45 +1,44 @@
-"""Leaky memory trace: exponential moving average of fired oscillator embeddings.
+"""Leaky memory trace: a recency boost for recently fired mini skills.
 
-The trace steers the Jev score (``w_mem`` term) and the query-aware state
-vector (``g_sim`` gain). It fades toward zero by construction: every update
-multiplies the old vector by ``alpha`` (0.95 default), so a beat that stops
-firing dissolves after roughly ``memory_fade_ticks``.
+The trace steers the Jev prefilter (``w_rec`` term). It fades with age: the
+boost for a skill that fired ``age`` ticks ago is ``alpha**age``, cut to zero
+after ``memory_fade_ticks``, so a beat that stops firing dissolves. No
+embeddings: memory is a dynamics-side signal about what recently fired, not
+a semantic vector.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-__all__ = ["MemoryTrace"]
+__all__ = ["RecencyTrace"]
 
 
-class MemoryTrace:
-    """Unit-norm EMA vector over recently fired oscillator embeddings."""
+class RecencyTrace:
+    """Exponentially decaying per-oscillator last-fired registry."""
 
-    def __init__(self, dim: int, alpha: float = 0.95) -> None:
-        self.dim = int(dim)
+    def __init__(self, alpha: float = 0.95, fade_ticks: int = 20) -> None:
         self.alpha = float(alpha)
-        self.vec: np.ndarray = np.zeros(self.dim, dtype=np.float32)
+        self.fade_ticks = int(fade_ticks)
+        self._last: dict[str, int] = {}
 
     @property
     def active(self) -> bool:
-        return bool(np.any(self.vec != 0.0))
+        return bool(self._last)
 
-    def update(self, embeddings: np.ndarray) -> None:
-        """Blend toward the (normalized) mean of the just-fired embeddings."""
-        mat = np.asarray(embeddings, dtype=np.float32)
-        if mat.size == 0:
-            return
-        norms = np.maximum(np.linalg.norm(mat, axis=1), 1e-8)
-        mean = (mat / norms[:, None]).mean(axis=0)
-        mean_norm = max(float(np.linalg.norm(mean)), 1e-8)
-        mean = (mean / mean_norm).astype(np.float32)
-        self.vec = (self.alpha * self.vec + (1.0 - self.alpha) * mean).astype(np.float32)
-        norm = max(float(np.linalg.norm(self.vec)), 1e-8)
-        self.vec = (self.vec / norm).astype(np.float32)
+    def update(self, osc_ids: list[str], tick: int) -> None:
+        """Record the oscillators that just fired at ``tick``."""
+        for osc_id in osc_ids:
+            self._last[str(osc_id)] = int(tick)
 
-    def similarity(self, normalized_embeddings: np.ndarray) -> np.ndarray:
-        """(N,) cosine of every oscillator embedding against the trace."""
-        if not self.active:
-            return np.zeros(normalized_embeddings.shape[0], dtype=np.float32)
-        return (normalized_embeddings @ self.vec).astype(np.float32)
+    def recency(self, ids: list[str], tick: int) -> np.ndarray:
+        """(N,) recency boost in [0, 1] for each oscillator id."""
+        out = np.zeros(len(ids), dtype=np.float32)
+        for i, osc_id in enumerate(ids):
+            last = self._last.get(str(osc_id))
+            if last is None:
+                continue
+            age = int(tick) - last
+            if 0 <= age <= self.fade_ticks:
+                out[i] = np.float32(self.alpha**age)
+        return out

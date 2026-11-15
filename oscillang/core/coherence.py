@@ -44,8 +44,8 @@ def compose_state_vector(
 ) -> np.ndarray:
     """Query-aware state vector: weighted sum of L2-normalized components.
 
-    Used when ``config.query_aware`` is set: components are I(t), the scene
-    objective, and recent thoughts. The result is L2-normalized.
+    Generic helper: components are e.g. an input encoding, a scene objective,
+    and recent thoughts. The result is L2-normalized.
     """
     if not components:
         return np.zeros(embedding_dim, dtype=np.float32)

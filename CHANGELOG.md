@@ -42,3 +42,36 @@
   coupling backend kicks in at 20k, so the O(N²) read disappears.
 - 200,000 composed oscillators: build + 3 ticks ≈ 170 ms total (budget 400 ms).
 - `core/` coverage: 94% (target >85%). ruff clean, mypy clean.
+
+## 0.2.0 - Milestone 5: Jev is the semantic gatekeeper (redesign)
+
+### Changed
+- **Jev's role corrected**: Jev verifies semantic coherence and alignment -
+  it is a reranker and the main gatekeeper of a mini skill. No embedding
+  cosine anywhere in the fire path; the oscillator layer is dynamics only.
+- `oscillang/core/gating.py`: lock gating is phase-only
+  (`phaseDiff < lockTolerance`, refractory veto); the coherence condition and
+  `lock_threshold` are gone. `phase_gating` remains as the ablation switch.
+- `oscillang/core/config.py`: dropped `w_coh`, `w_mem`, `g_sim`, `g_self`,
+  `query_aware`, `lock_threshold`; added `w_rec` (recency boost) and
+  `jev_shortlist` (reranker shortlist size, default 24).
+- `oscillang/jev/`: new contracts - `JevContext` is dynamics-only (phase
+  proximity, recency, amplitude, use cost, coupling, refractory, noise);
+  `JevModel.score` is the numeric role (RuleJev prefilter, MlpJev learned
+  hook); `JevReranker.rerank` is the semantic role: candidates arrive as
+  `JevCandidate` (actual trigger/fragment/examples texts) and come back as
+  `JevVerdict` alignment scores. `LlmJev` is the default reranker (one
+  schema-validated call per fire decision; silence never fires).
+- `oscillang/runtime/`: new fire flow - uniform `g_ext` phase drive, dynamics
+  prefilter shortlist, LlmJev alignment verification, then the hard gate
+  (verdict above adaptive `v_threshold`, phase-locked to the highest-verdict
+  leader, not refractory, capped at `top_k`). `MemoryTrace` (embedding EMA)
+  replaced by `RecencyTrace` (per-skill last-fired decay, `alpha**age`, no
+  embeddings). `world_model` now feeds the previous beat to the reranker as
+  context. Guards consume the best alignment verdict.
+
+### Tests
+- Full rewrite of `test_gating`, `test_jev`, `test_runtime` for the phase-only
+  gate and the reranker flow; `test_performance` ticks the phase-only path.
+- Suite: 234 tests, core/skills/llm coverage 95% (target >85%). ruff clean,
+  mypy clean.

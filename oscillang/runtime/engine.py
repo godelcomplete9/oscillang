@@ -1,18 +1,23 @@
-"""The rotatory prompting runtime: perturb, evolve, gate, fire, render.
+"""The rotatory prompting runtime: perturb, prefilter, verify, gate, fire, render.
 
 One ``respond`` turn:
-1. Encode the user input into the lattice's embedding space; the state vector
-   is ``g_ext`` * input + ``g_sim`` * memory trace + ``g_self`` * last output.
-2. Perturb phases (external drive proportional to coherence, plus guard noise).
-3. Score every oscillator with the numeric Jev: coherence, phase proximity,
-   memory, amplitude, minus use cost and coupling pressure, plus noise.
-4. Fire decision: lock gate (phase AND coherence AND not refractory) AND
-   Jev > adaptive threshold, capped at ``top_k``. Main Brain renders once for
-   the whole fired set - never per oscillator.
+1. Perturb phases: a uniform external drive (``g_ext``) plus any guard noise
+   injection. No embedding-weighted drive - the oscillator layer is dynamics
+   only.
+2. Dynamics prefilter: RuleJev scores every oscillator from dynamics only
+   (phase proximity to the amplitude-weighted reference, recency, amplitude,
+   minus use cost and coupling pressure, plus noise). The top
+   ``jev_shortlist`` non-refractory candidates form the reranker's shortlist.
+3. Jev verifies semantic coherence and alignment: the reranker (default
+   ``LlmJev``) receives the user input and each shortlisted mini skill's
+   actual texts and returns an alignment verdict per candidate. If a numeric
+   ``JevModel`` is injected instead, its score is thresholded directly
+   (dynamics-only mode).
+4. Fire decision: verdict above the adaptive threshold AND phase-locked to
+   the leader (highest verdict) AND not refractory, capped at ``top_k``.
+   Main Brain renders once for the whole fired set - never per oscillator.
 5. Dynamics step (phase, fatigue, refractory), ``record_use`` per fired skill
-   (promotion after more than 5 uses), memory trace update, guard update.
-
-``learned_jev`` is reserved: this milestone always uses the numeric scorer.
+   (promotion after more than 5 uses), recency update, guard update.
 """
 
 from __future__ import annotations
@@ -21,7 +26,6 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from oscillang.core.coherence import compose_state_vector
 from oscillang.core.config import Config
 from oscillang.core.dynamics import step_lattice
 from oscillang.core.gating import (
@@ -30,12 +34,13 @@ from oscillang.core.gating import (
     retrieval_top_k,
     wrap_phase_diff,
 )
-from oscillang.core.lattice import OscillatorLattice, l2_normalize_rows
-from oscillang.jev.base import JevContext, JevModel
+from oscillang.core.lattice import OscillatorLattice
+from oscillang.jev.base import JevCandidate, JevContext, JevModel, JevReranker, JevVerdict
+from oscillang.jev.llm_jev import LlmJev
 from oscillang.jev.rule_jev import RuleJev
 from oscillang.llm.base import ChatModel, InvokeOptions, Message
 from oscillang.runtime.guards import GuardState
-from oscillang.runtime.memory import MemoryTrace
+from oscillang.runtime.memory import RecencyTrace
 from oscillang.skills.composer import Composer
 from oscillang.skills.model import EmbeddingModel, MiniSkill
 from oscillang.skills.store import SkillStore
@@ -56,12 +61,12 @@ class TickResult:
     skill_ids: list[str]
     guard_events: list[str]
     v_threshold: float
-    max_coherence: float
+    max_verdict: float
     events: list[dict[str, str]] = field(default_factory=list)
 
 
 class Runtime:
-    """Gate behavioral fragments with the numeric Jev; render with Main Brain."""
+    """Gate mini skills with Jev's alignment verdicts; render with Main Brain."""
 
     def __init__(
         self,
@@ -73,10 +78,14 @@ class Runtime:
         seed: int = 0,
         premise: str = "",
         guiding_words: list[str] | None = None,
-        jev: JevModel | None = None,
+        jev: JevReranker | JevModel | None = None,
+        prefilter: JevModel | None = None,
     ) -> None:
         self.config = (config or Config()).validated()
-        self.jev: JevModel = jev if jev is not None else RuleJev(self.config)
+        self.jev: JevReranker | JevModel = (
+            jev if jev is not None else LlmJev(chat_model, temperature=0.0)
+        )
+        self.prefilter: JevModel = prefilter if prefilter is not None else RuleJev(self.config)
         self.lattice = lattice
         self.store = store
         self.chat_model = chat_model
@@ -90,7 +99,9 @@ class Runtime:
         self.premise = premise
         self.guiding_words = list(guiding_words or [])
         self.rng = np.random.default_rng(seed)
-        self.memory = MemoryTrace(lattice.embedding_dim, self.config.memory_alpha)
+        self.memory = RecencyTrace(
+            alpha=self.config.memory_alpha, fade_ticks=self.config.memory_fade_ticks
+        )
         self.guards = GuardState(self.config)
         self.tick = 0
         self.events: list[dict[str, str]] = []
@@ -102,60 +113,17 @@ class Runtime:
             config=self.config,
             seed=seed,
         )
-        self._last_output_emb: np.ndarray | None = None
+        self._last_response: str = ""
         self._inject_next = 0.0
         self._nudge_next = False
-        self._skill_count = -1
-        self._skill_normed = np.zeros((0, lattice.embedding_dim), dtype=np.float32)
 
-    # --- skill-embedding channel ----------------------------------------------
-    def _refresh_skill_embeddings(self) -> None:
-        """Coherence is measured against skill texts, not path texts: the
-        oscillators' retrieval meaning lives in their mini skills."""
-        count = self.store.count()
-        if count == self._skill_count:
-            return
-        n = self.lattice.n
-        texts: list[str] = []
-        for row in range(n):
-            skill = self.store.get_by_oscillator(str(self.lattice.ids[row]))
-            if skill is None:
-                texts.append("")
-            else:
-                texts.append(f"{skill.trigger} {skill.prompt_fragment} {' '.join(skill.examples)}")
-        emb = (
-            self.embedder.embed_texts(texts)
-            if texts
-            else np.zeros((0, self.lattice.embedding_dim), dtype=np.float32)
-        )
-        self._skill_normed = l2_normalize_rows(emb)
-        self._skill_count = count
-
-    # --- encoding -------------------------------------------------------------
-    def _state_vector(self, user_input: str) -> np.ndarray:
-        q = self.embedder.embed_texts([user_input])[0]
-        norm = max(float(np.linalg.norm(q)), 1e-8)
-        comps: list[tuple[np.ndarray, float]] = [(q / norm, self.config.g_ext)]
-        if self.config.leaky_memory and self.memory.active:
-            comps.append((self.memory.vec, self.config.g_sim))
-        if self.config.world_model and self._last_output_emb is not None:
-            comps.append((self._last_output_emb, self.config.g_self))
-        return compose_state_vector(comps, self.lattice.embedding_dim)
-
-    # --- scoring --------------------------------------------------------------
-    def _reference_phase(self, phase: np.ndarray, coherence: np.ndarray) -> float:
-        weights = np.clip(coherence, 0.0, None) + 1e-6
+    # --- dynamics context ------------------------------------------------------
+    def _reference_phase(self, phase: np.ndarray, amplitude: np.ndarray) -> float:
+        weights = np.clip(amplitude, 0.0, None) + 1e-6
         z = np.sum(weights.astype(np.complex128) * np.exp(1j * phase.astype(np.float64)))
         return float(np.angle(z)) % TWO_PI
 
-    def _jev_context(
-        self,
-        ids: list[str],
-        coherence: np.ndarray,
-        phase: np.ndarray,
-        ref_phase: float,
-        memory_sim: np.ndarray,
-    ) -> JevContext:
+    def _jev_context(self, ids: list[str], phase: np.ndarray, ref_phase: float) -> JevContext:
         cfg = self.config
         n = self.lattice.n
         phase_prox = (1.0 - wrap_phase_diff(phase - ref_phase) / PI).astype(np.float32)
@@ -180,17 +148,33 @@ class Runtime:
             else np.zeros(n, dtype=np.float32)
         )
         refractory = self.lattice.refractory_until_tick[:n] > self.tick
+        recency = (
+            self.memory.recency(ids, self.tick)
+            if cfg.leaky_memory
+            else np.zeros(n, dtype=np.float32)
+        )
         return JevContext(
             ids=ids,
-            coherence=coherence,
             phase_prox=phase_prox,
-            memory_sim=memory_sim,
+            recency=recency,
             amplitude=amp,
             used_cost=cost,
             coupling=coup,
             refractory=refractory,
             noise=noise,
         )
+
+    def _shortlist_rows(self, pre: np.ndarray, refractory: np.ndarray) -> list[int]:
+        """Top ``jev_shortlist`` non-refractory rows by prefilter score."""
+        eligible = np.where(~refractory)[0]
+        if eligible.size == 0:
+            return []
+        order = eligible[np.argsort(-pre[eligible])[: self.config.jev_shortlist]]
+        return [int(r) for r in order]
+
+    def _verdict_vector(self, ids: list[str], verdicts: list[JevVerdict]) -> np.ndarray:
+        vmap = {v.oscillator_id: v.score for v in verdicts}
+        return np.array([vmap.get(oid, 0.0) for oid in ids], dtype=np.float32)
 
     # --- rendering ------------------------------------------------------------
     def _fragment_block(self, skills: list[MiniSkill]) -> str:
@@ -237,7 +221,7 @@ class Runtime:
 
     # --- main loop ------------------------------------------------------------
     def respond(self, user_input: str, evolve_ticks: int = 0) -> TickResult:
-        """One rotatory turn: perturb, (optionally evolve), fire, render, step."""
+        """One rotatory turn: perturb, prefilter, verify, fire, render, step."""
         n = self.lattice.n
         cfg = self.config
         if evolve_ticks > 0:
@@ -245,42 +229,54 @@ class Runtime:
                 step_lattice(self.lattice, self.tick, cfg)
                 self.tick += 1
 
-        state = self._state_vector(user_input)
-        self._refresh_skill_embeddings()
-        coherence = (self._skill_normed @ state).astype(np.float32)
-        phase = self.lattice.phase[:n]
-
-        kick = (cfg.g_ext * np.clip(coherence, 0.0, None) + self._inject_next).astype(np.float32)
-        self.lattice.phase[:n] = np.mod(phase + kick, TWO_PI).astype(np.float32)
+        kick = np.float32(cfg.g_ext + self._inject_next)
+        self.lattice.phase[:n] = np.mod(self.lattice.phase[:n] + kick, TWO_PI).astype(np.float32)
         self._inject_next = 0.0
 
-        ref_phase = self._reference_phase(self.lattice.phase[:n], coherence)
-        memory_sim = self.memory.similarity(self._skill_normed)
+        ref_phase = self._reference_phase(self.lattice.phase[:n], self.lattice.amplitude[:n])
         ids = [str(i) for i in self.lattice.ids[:n]]
-        ctx = self._jev_context(ids, coherence, self.lattice.phase[:n], ref_phase, memory_sim)
-        jev = self.jev.score(ctx)
+        ctx = self._jev_context(ids, self.lattice.phase[:n], ref_phase)
+        pre = self.prefilter.score(ctx)
 
-        # Candidate pool: Jev above the (adaptive) threshold and not refractory.
-        refractory = ctx.refractory
-        pool = (jev > self.guards.v_threshold) & ~refractory
+        if hasattr(self.jev, "rerank"):
+            rows = self._shortlist_rows(pre, ctx.refractory)
+            candidates: list[JevCandidate] = []
+            for row in rows:
+                skill = self.store.get_by_oscillator(ids[row])
+                if skill is not None:
+                    candidates.append(
+                        JevCandidate(
+                            oscillator_id=ids[row],
+                            skill_id=skill.id,
+                            trigger=skill.trigger,
+                            prompt_fragment=skill.prompt_fragment,
+                            examples=tuple(skill.examples),
+                        )
+                    )
+            context = self._last_response if cfg.world_model else ""
+            verdicts = self.jev.rerank(user_input, candidates, context)
+            v = self._verdict_vector(ids, verdicts)
+        else:
+            v = np.asarray(pre, dtype=np.float32)
+        max_v = float(v.max()) if n > 0 else 0.0
+
+        pool = (v > self.guards.v_threshold) & ~ctx.refractory
         fired_idx = np.empty(0, dtype=np.int64)
         fired_scores = np.empty(0, dtype=np.float32)
         if np.any(pool):
             pool_rows = np.nonzero(pool)[0]
-            leader_row = int(pool_rows[np.argmax(jev[pool_rows])])
-            # Lock gate against the leader: phase lock AND coherence agreement.
-            coh_to_leader = self._skill_normed[pool_rows] @ self._skill_normed[leader_row]
-            locked = lock_gate_reference(
-                self.lattice.phase[:n][pool_rows],
-                float(self.lattice.phase[leader_row]),
-                coh_to_leader,
-                lock_tolerance=cfg.lock_tolerance,
-                lock_threshold=cfg.lock_threshold,
-                phase_gating=cfg.phase_gating,
-            )
-            locked_rows = pool_rows[locked]
+            leader_row = int(pool_rows[np.argmax(v[pool_rows])])
+            if cfg.phase_gating:
+                locked = lock_gate_reference(
+                    self.lattice.phase[:n][pool_rows],
+                    float(self.lattice.phase[leader_row]),
+                    lock_tolerance=cfg.lock_tolerance,
+                )
+                locked_rows = pool_rows[locked]
+            else:
+                locked_rows = pool_rows
             fired_idx, fired_scores = retrieval_top_k(
-                jev, cfg.top_k, exclude_mask=~np.isin(np.arange(n), locked_rows)
+                v, cfg.top_k, exclude_mask=~np.isin(np.arange(n), locked_rows)
             )
             finite = np.isfinite(fired_scores)
             fired_idx = fired_idx[finite]
@@ -304,20 +300,18 @@ class Runtime:
             for osc_id in fired_ids:
                 if self.store.get_by_oscillator(osc_id) is not None:
                     self._composer.record_use(osc_id)
+            self.memory.update(fired_ids, self.tick)
         else:
             self._nudge_next = False
 
         step_lattice(self.lattice, self.tick, cfg, fire_mask=fire_mask)
         self.lattice.last_fired_tick[:n][fire_mask] = self.tick
 
-        if fired_idx.size > 0:
-            self.memory.update(self.lattice.embeddings[fired_idx])
         if cfg.world_model and response.strip():
-            self._last_output_emb = self.embedder.embed_texts([response])[0]
+            self._last_response = response
 
-        max_coh = float(coherence.max()) if n > 0 else 0.0
         guard_events = self.guards.update(
-            fired=bool(fired_idx.size), max_coherence=max_coh, responded=bool(response.strip())
+            fired=bool(fired_idx.size), max_verdict=max_v, responded=bool(response.strip())
         )
         if "dead_coherence_noise_inject" in guard_events:
             self._inject_next = cfg.guard_noise_inject
@@ -340,6 +334,6 @@ class Runtime:
             skill_ids=skill_ids,
             guard_events=guard_events,
             v_threshold=self.guards.v_threshold,
-            max_coherence=max_coh,
+            max_verdict=max_v,
             events=list(self.events),
         )
